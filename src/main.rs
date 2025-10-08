@@ -21,6 +21,9 @@ use crossterm::{
 use anyhow::Result;
 use serde::Deserialize;
 
+/// Default ASCII art (fallback when user files don't exist)
+const DEFAULT_ASCII_ART: &str = include_str!("../default_ascii.txt");
+
 /// TOML Config structures
 #[derive(Debug, Deserialize)]
 struct TomlConfig {
@@ -161,7 +164,10 @@ fn read_ascii_for_phase(phase: Phase, ascii_dir: &PathBuf, ascii_config: &AsciiA
     
     match fs::read_to_string(&path) {
         Ok(s) => Some(s.trim_end_matches('\n').to_string()),
-        Err(_) => None,
+        Err(_) => {
+            // Use default ASCII art as fallback
+            Some(DEFAULT_ASCII_ART.trim_end_matches('\n').to_string())
+        }
     }
 }
 
@@ -389,27 +395,15 @@ fn draw(state: &State, cfg: &Config) -> Result<()> {
         .as_deref()
         .map(|s| s.lines().collect())
         .unwrap_or_else(|| Vec::new());
-    let art_width = art_lines.iter().map(|l| l.len() as u16).max().unwrap_or(0);
+    // Use char count, not byte length, for proper Unicode handling
+    let art_width = art_lines.iter().map(|l| l.chars().count() as u16).max().unwrap_or(0);
     let art_height = art_lines.len() as u16;
 
-    // Calculate text block width (max of label and timer for ASCII art positioning)
-    let text_width = max(label.len(), timer.len()) as u16;
-    
-    // Spacing between text and ASCII art
-    let spacing = 4u16;
-    
-    // Calculate total content width (text + spacing + art)
-    let combined_width = if art_width > 0 {
-        text_width + spacing + art_width
-    } else {
-        text_width
-    };
-    
     // Progress bar width
     let bar_w = 60usize;
     let bar_total_width = (bar_w + 2) as u16; // +2 for the brackets
     
-    // Center the content unit relative to the progress bar
+    // Position elements
     let bar_x = box_offset_x + pad;
     
     // Title (centered relative to progress bar)
@@ -422,12 +416,9 @@ fn draw(state: &State, cfg: &Config) -> Result<()> {
         Print(title),
         SetAttribute(Attribute::Reset)
     )?;
-    let content_center_offset = if bar_total_width > combined_width {
-        (bar_total_width - combined_width) / 2
-    } else {
-        0
-    };
-    let start_x = bar_x + content_center_offset;
+    
+    // Position timer/action on the left
+    let start_x = bar_x;
     let content_y = box_offset_y + pad + 3;
     
     // Vertically center the text within the ASCII art height
@@ -438,7 +429,7 @@ fn draw(state: &State, cfg: &Config) -> Result<()> {
         0
     };
     
-    // Draw phase label (left-aligned within text block, vertically aligned with art)
+    // Draw phase label (left-aligned)
     queue!(
         out,
         cursor::MoveTo(start_x, content_y + text_offset_y),
@@ -462,9 +453,12 @@ fn draw(state: &State, cfg: &Config) -> Result<()> {
         SetAttribute(Attribute::Reset)
     )?;
 
-    // Draw ASCII art (if available) next to the text
+    // Draw ASCII art (if available) aligned to the right of the box
     if art_width > 0 {
-        let art_x = start_x + text_width + spacing;
+        // Right-align ASCII art within the progress bar width
+        let art_right_edge = bar_x + bar_total_width;
+        let art_x = art_right_edge.saturating_sub(art_width);
+        
         for (i, line) in art_lines.iter().enumerate() {
             let y = content_y + i as u16;
             if y >= box_offset_y + box_height.saturating_sub(pad) {
@@ -501,7 +495,7 @@ fn draw(state: &State, cfg: &Config) -> Result<()> {
     let footer_y = bar_y + 2;
     let info = vec![
         format!("sessions: {}  (long every {})", state.sessions_completed, cfg.long_every),
-        "keys: [s]tart work  [p]ause/resume  [n]ext  [q]uit".to_string(),
+        "keys: [s]tart work  [p]ause/resume  [q]uit".to_string(),
         format!("log: {}", cfg.log_path.display()),
         format!("ascii: {}", cfg.ascii_dir.display()),
     ];
@@ -577,41 +571,6 @@ fn main() -> Result<()> {
                                 state.paused = !state.paused;
                                 let _ = draw(&state, &cfg);
                             }
-                        }
-                        KeyCode::Char('n') => {
-                            // Skip to next phase (dev/testing)
-                            // Force-complete current phase
-                            match state.phase {
-                                Phase::Work => {
-                                    log_phase(&cfg.log_path, Phase::Work, cfg.work_sec, state.started_at);
-                                    state.sessions_completed += 1;
-                                    let long_break = state.sessions_completed % cfg.long_every == 0;
-                                    let next_phase = if long_break { Phase::Long } else { Phase::Short };
-                                    update_phase(&mut state, next_phase, &cfg);
-                                    state.remaining = if long_break { cfg.long_sec as f64 } else { cfg.short_sec as f64 };
-                                    state.started_at = Some(Instant::now());
-                                    state.paused = false;
-                                }
-                                Phase::Short | Phase::Long => {
-                                    log_phase(
-                                        &cfg.log_path,
-                                        state.phase,
-                                        if state.phase == Phase::Long { cfg.long_sec } else { cfg.short_sec },
-                                        state.started_at
-                                    );
-                                    update_phase(&mut state, Phase::Idle, &cfg);
-                                    state.remaining = 0.0;
-                                    state.started_at = None;
-                                    state.paused = false;
-                                }
-                                Phase::Idle => {
-                                    update_phase(&mut state, Phase::Work, &cfg);
-                                    state.remaining = cfg.work_sec as f64;
-                                    state.started_at = Some(Instant::now());
-                                    state.paused = false;
-                                }
-                            }
-                            let _ = draw(&state, &cfg);
                         }
                         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
                             // Graceful exit on Ctrl+C
