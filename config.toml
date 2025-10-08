@@ -1,0 +1,36 @@
+# Ptimer Default Configuration
+# Edit these values to customize the Pomodoro timer behavior
+
+[durations]
+# Work session duration in minutes
+work_min = 25
+
+# Short break duration in minutes
+short_min = 5
+
+# Long break duration in minutes
+long_min = 15
+
+# Number of work sessions before a long break
+long_every = 4
+
+[paths]
+# Directory to store log files (will be created if it doesn't exist)
+log_dir = ".ptimer/logs"
+
+# Directory to store ASCII art files (will be created if it doesn't exist)
+ascii_dir = ".ptimer/ascii_art"
+
+# Name of the log CSV file
+log_filename = "pomodoro.csv"
+
+[ascii_art]
+# Enable ASCII art display (true/false)
+enabled = true
+
+# ASCII art filenames for each phase (stored in ascii_dir)
+idle_file = "idle.txt"
+work_file = "work.txt"
+short_file = "short.txt"
+long_file = "long.txt"
+
