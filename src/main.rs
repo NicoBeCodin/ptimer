@@ -540,7 +540,8 @@ fn main() -> Result<()> {
     let _ = draw(&state, &cfg);
 
     // Main loop
-    let tick = Duration::from_millis(100);
+    let tick = Duration::from_millis(250);
+    let mut last_drawn_second: i64 = -1;
     'outer: loop {
         // Handle input or resize
         if event::poll(tick)? {
@@ -619,11 +620,15 @@ fn main() -> Result<()> {
                             state.started_at = None;
                             state.paused = false;
                         }
+                        last_drawn_second = -1; // Force redraw on phase change
                         let _ = draw(&state, &cfg);
                     } else {
-                        // redraw about twice a second for smoothness
-                        // (cheap; we can just redraw every loop)
-                        let _ = draw(&state, &cfg);
+                        // Only redraw when the displayed second changes
+                        let current_second = state.remaining.floor() as i64;
+                        if current_second != last_drawn_second {
+                            last_drawn_second = current_second;
+                            let _ = draw(&state, &cfg);
+                        }
                     }
                 }
                 Phase::Idle => {} // nothing
