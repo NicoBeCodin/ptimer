@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use anyhow::Result;
 use chrono::Local;
 use clap::{Arg, Command as ClapCommand};
 use crossterm::{
@@ -12,13 +13,8 @@ use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute, queue,
     style::{Attribute, Print, SetAttribute},
-    terminal::{
-        self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
-        SetTitle,
-    },
-
+    terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, SetTitle},
 };
-use anyhow::Result;
 use serde::Deserialize;
 
 /// Default ASCII art (fallback when user files don't exist)
@@ -59,23 +55,27 @@ struct AsciiArtConfig {
 /// Load config from config.toml or use hardcoded defaults
 fn load_toml_config() -> TomlConfig {
     let config_path = PathBuf::from("config.toml");
-    
+
     if config_path.exists() {
         match fs::read_to_string(&config_path) {
-            Ok(contents) => {
-                match toml::from_str::<TomlConfig>(&contents) {
-                    Ok(config) => return config,
-                    Err(e) => {
-                        eprintln!("Warning: Failed to parse config.toml: {}. Using defaults.", e);
-                    }
+            Ok(contents) => match toml::from_str::<TomlConfig>(&contents) {
+                Ok(config) => return config,
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Failed to parse config.toml: {}. Using defaults.",
+                        e
+                    );
                 }
-            }
+            },
             Err(e) => {
-                eprintln!("Warning: Failed to read config.toml: {}. Using defaults.", e);
+                eprintln!(
+                    "Warning: Failed to read config.toml: {}. Using defaults.",
+                    e
+                );
             }
         }
     }
-    
+
     // Default config if file doesn't exist or failed to parse
     TomlConfig {
         durations: Durations {
@@ -120,7 +120,7 @@ impl Phase {
             Phase::Long => "LONG PAUSE",
         }
     }
-    
+
     fn ascii_filename(self, config: &AsciiArtConfig) -> &str {
         match self {
             Phase::Idle => &config.idle_file,
@@ -145,23 +145,27 @@ struct Config {
 #[derive(Debug)]
 struct State {
     phase: Phase,
-    remaining: f64,            // seconds, fractional
+    remaining: f64, // seconds, fractional
     started_at: Option<Instant>,
     paused: bool,
-    sessions_completed: u64,   // # completed WORK sessions
+    sessions_completed: u64, // # completed WORK sessions
     ascii_art: Option<String>,
     last_size: (u16, u16),
 }
 
 /// Read ASCII art for a specific phase
-fn read_ascii_for_phase(phase: Phase, ascii_dir: &PathBuf, ascii_config: &AsciiArtConfig) -> Option<String> {
+fn read_ascii_for_phase(
+    phase: Phase,
+    ascii_dir: &PathBuf,
+    ascii_config: &AsciiArtConfig,
+) -> Option<String> {
     if !ascii_config.enabled {
         return None;
     }
-    
+
     let filename = phase.ascii_filename(ascii_config);
     let path = ascii_dir.join(filename);
-    
+
     match fs::read_to_string(&path) {
         Ok(s) => Some(s.trim_end_matches('\n').to_string()),
         Err(_) => {
@@ -178,43 +182,35 @@ fn update_phase(state: &mut State, new_phase: Phase, cfg: &Config) {
 }
 
 /// Best-effort: ring bell and try to raise terminal.
-fn alert_bring_to_front() {
-    // Terminal bell
-    print!("\x07");
-    let _ = io::stdout().flush();
+fn alert_bring_to_front(phase: Phase) {
+    use std::io::Write;
+    print!("\x07"); // bell
+    let _ = std::io::stdout().flush();
 
-    // Set a unique title (helps some WMs find the window)
-    let unique = format!("Pomodoro Alert {}", Local::now().timestamp());
-    let _ = execute!(io::stdout(), SetTitle(unique.clone()));
-
-    // Platform-specific nudges
-    #[cfg(target_os = "macos")]
-    {
-        // Try to activate Apple Terminal and iTerm
-        let _ = Command::new("osascript")
-            .arg("-e")
-            .arg(r#"tell application "Terminal" to activate"#)
+    // Get this terminal's window and activate it
+    if which::which("xdotool").is_ok() {
+        let _ = std::process::Command::new("xdotool")
+            .args(["getactivewindow", "windowactivate", "--sync"])
             .status();
-        let _ = Command::new("osascript")
-            .arg("-e")
-            .arg(r#"tell application "iTerm" to activate"#)
+    } else if which::which("wmctrl").is_ok() {
+        let _ = std::process::Command::new("wmctrl")
+            .args(["-a", "Terminal"])
             .status();
     }
 
-    #[cfg(target_os = "linux")]
-    {
-        // If available, try wmctrl & notify-send
-        if which::which("wmctrl").is_ok() {
-            let _ = Command::new("wmctrl").arg("-a").arg(unique).status();
-        }
-        if which::which("notify-send").is_ok() {
-            let _ = Command::new("notify-send")
-                .args(["-u", "critical", "Pomodoro", "Time's up!"])
-                .status();
-        }
+    let phase_str = match phase {
+        Phase::Idle => "IDLE",
+        Phase::Work => "WORK",
+        Phase::Short => "PAUSE",
+        Phase::Long => "LONG PAUSE",
+    };
+    let msg = format!("\n\n   {} ENDED   \n\n", phase_str);
+    // Backup notification
+    if which::which("notify-send").is_ok() {
+        let _ = std::process::Command::new("notify-send")
+            .args(["-u", "critical", "PTimer", msg.as_str()])
+            .status();
     }
-
-    // Windows: bell is often enough; bringing windows to foreground programmatically is restricted.
 }
 
 /// Write a CSV log row.
@@ -223,7 +219,11 @@ fn log_phase(log_path: &PathBuf, phase: Phase, configured_secs: u64, started_at:
         return;
     }
     let elapsed = started_at.unwrap().elapsed().as_secs();
-    let duration = if configured_secs == 0 { elapsed } else { min(elapsed, configured_secs) };
+    let duration = if configured_secs == 0 {
+        elapsed
+    } else {
+        min(elapsed, configured_secs)
+    };
 
     let ts = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
     let phase_str = match phase {
@@ -254,7 +254,7 @@ fn human_mmss(total_seconds: f64) -> String {
 fn parse_cli() -> Config {
     // Load TOML config first
     let toml_cfg = load_toml_config();
-    
+
     let m = ClapCommand::new("ptimer")
         .about("Terminal Pomodoro (reactive, logs sessions, optional ASCII art)")
         .arg(
@@ -263,7 +263,10 @@ fn parse_cli() -> Config {
                 .short('w')
                 .num_args(1)
                 .value_name("MIN")
-                .help(&format!("Work duration in minutes (default {})", toml_cfg.durations.work_min)),
+                .help(&format!(
+                    "Work duration in minutes (default {})",
+                    toml_cfg.durations.work_min
+                )),
         )
         .arg(
             Arg::new("short")
@@ -271,7 +274,10 @@ fn parse_cli() -> Config {
                 .short('s')
                 .num_args(1)
                 .value_name("MIN")
-                .help(&format!("Short break in minutes (default {})", toml_cfg.durations.short_min)),
+                .help(&format!(
+                    "Short break in minutes (default {})",
+                    toml_cfg.durations.short_min
+                )),
         )
         .arg(
             Arg::new("long")
@@ -279,7 +285,10 @@ fn parse_cli() -> Config {
                 .short('l')
                 .num_args(1)
                 .value_name("MIN")
-                .help(&format!("Long break in minutes (default {})", toml_cfg.durations.long_min)),
+                .help(&format!(
+                    "Long break in minutes (default {})",
+                    toml_cfg.durations.long_min
+                )),
         )
         .arg(
             Arg::new("long_every")
@@ -287,7 +296,10 @@ fn parse_cli() -> Config {
                 .short('n')
                 .num_args(1)
                 .value_name("N")
-                .help(&format!("Use a long break every N work sessions (default {})", toml_cfg.durations.long_every)),
+                .help(&format!(
+                    "Use a long break every N work sessions (default {})",
+                    toml_cfg.durations.long_every
+                )),
         )
         .arg(
             Arg::new("log")
@@ -327,12 +339,12 @@ fn parse_cli() -> Config {
 
     // Set up paths (in home directory by default)
     let home = get_home_dir();
-    
+
     let log_dir = m
         .get_one::<String>("log")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(&toml_cfg.paths.log_dir));
-    
+
     let ascii_dir = m
         .get_one::<String>("ascii")
         .map(PathBuf::from)
@@ -342,7 +354,7 @@ fn parse_cli() -> Config {
     if let Err(e) = fs::create_dir_all(&log_dir) {
         eprintln!("Warning: Failed to create log directory: {}", e);
     }
-    
+
     if let Err(e) = fs::create_dir_all(&ascii_dir) {
         eprintln!("Warning: Failed to create ASCII art directory: {}", e);
     }
@@ -366,21 +378,26 @@ fn draw(state: &State, cfg: &Config) -> Result<()> {
     let (cols, rows) = state.last_size;
 
     // Clear
-    queue!(out, cursor::Hide, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
+    queue!(
+        out,
+        cursor::Hide,
+        cursor::MoveTo(0, 0),
+        Clear(ClearType::All)
+    )?;
 
     // Constrain to max box size
     const MAX_BOX_WIDTH: u16 = 150;
     const MAX_BOX_HEIGHT: u16 = 100;
-    
+
     let _box_width = min(MAX_BOX_WIDTH, cols);
     let box_height = min(MAX_BOX_HEIGHT, rows);
-    
+
     // Position box on the left side of terminal
     let box_offset_x = 0u16;
     let box_offset_y = 0u16;
-    
+
     let pad = 2u16;
-    
+
     // Prepare text content
     let label = format!("[ {} ]", state.phase.label());
     let timer = if state.phase == Phase::Idle {
@@ -396,16 +413,20 @@ fn draw(state: &State, cfg: &Config) -> Result<()> {
         .map(|s| s.lines().collect())
         .unwrap_or_else(|| Vec::new());
     // Use char count, not byte length, for proper Unicode handling
-    let art_width = art_lines.iter().map(|l| l.chars().count() as u16).max().unwrap_or(0);
+    let art_width = art_lines
+        .iter()
+        .map(|l| l.chars().count() as u16)
+        .max()
+        .unwrap_or(0);
     let art_height = art_lines.len() as u16;
 
     // Progress bar width
     let bar_w = 60usize;
     let bar_total_width = (bar_w + 2) as u16; // +2 for the brackets
-    
+
     // Position elements
     let bar_x = box_offset_x + pad;
-    
+
     // Title (centered relative to progress bar)
     let title = "PTIMER";
     let title_x = bar_x + ((bar_total_width as i32 - title.len() as i32) / 2).max(0) as u16;
@@ -416,11 +437,11 @@ fn draw(state: &State, cfg: &Config) -> Result<()> {
         Print(title),
         SetAttribute(Attribute::Reset)
     )?;
-    
+
     // Position timer/action on the left
     let start_x = bar_x;
     let content_y = box_offset_y + pad + 3;
-    
+
     // Vertically center the text within the ASCII art height
     let text_block_height = 3u16; // label + 1 space + timer
     let text_offset_y = if art_height > text_block_height {
@@ -428,7 +449,7 @@ fn draw(state: &State, cfg: &Config) -> Result<()> {
     } else {
         0
     };
-    
+
     // Draw phase label (left-aligned)
     queue!(
         out,
@@ -437,7 +458,7 @@ fn draw(state: &State, cfg: &Config) -> Result<()> {
         Print(&label),
         SetAttribute(Attribute::Reset)
     )?;
-    
+
     // Draw timer (centered relative to the label above it)
     let timer_offset = (label.len() as i32 - timer.len() as i32) / 2;
     let timer_x = if timer_offset > 0 {
@@ -458,7 +479,7 @@ fn draw(state: &State, cfg: &Config) -> Result<()> {
         // Right-align ASCII art within the progress bar width
         let art_right_edge = bar_x + bar_total_width;
         let art_x = art_right_edge.saturating_sub(art_width);
-        
+
         for (i, line) in art_lines.iter().enumerate() {
             let y = content_y + i as u16;
             if y >= box_offset_y + box_height.saturating_sub(pad) {
@@ -470,7 +491,7 @@ fn draw(state: &State, cfg: &Config) -> Result<()> {
 
     // Progress bar (underneath the combined content, left-aligned within box)
     let bar_y = content_y + max(text_block_height + text_offset_y, art_height) + 2;
-    
+
     let total = match state.phase {
         Phase::Work => cfg.work_sec,
         Phase::Short => cfg.short_sec,
@@ -494,13 +515,20 @@ fn draw(state: &State, cfg: &Config) -> Result<()> {
     // Footer info (below progress bar, left-aligned within box)
     let footer_y = bar_y + 2;
     let info = vec![
-        format!("sessions: {}  (long every {})", state.sessions_completed, cfg.long_every),
+        format!(
+            "sessions: {}  (long every {})",
+            state.sessions_completed, cfg.long_every
+        ),
         "keys: [s]tart work  [p]ause/resume  [q]uit".to_string(),
         format!("log: {}", cfg.log_path.display()),
         format!("ascii: {}", cfg.ascii_dir.display()),
     ];
     for (i, line) in info.iter().enumerate() {
-        queue!(out, cursor::MoveTo(box_offset_x + pad, footer_y + i as u16), Print(&line))?;
+        queue!(
+            out,
+            cursor::MoveTo(box_offset_x + pad, footer_y + i as u16),
+            Print(&line)
+        )?;
     }
 
     out.flush()?;
@@ -513,7 +541,11 @@ fn main() -> Result<()> {
 
     // Pre-create log file with header if missing
     if !cfg.log_path.exists() {
-        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&cfg.log_path) {
+        if let Ok(mut f) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&cfg.log_path)
+        {
             let _ = writeln!(f, "timestamp,phase,duration_sec,notes");
         }
     }
@@ -532,7 +564,12 @@ fn main() -> Result<()> {
 
     // Terminal setup
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, cursor::Hide, SetTitle("ptimer"))?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        cursor::Hide,
+        SetTitle("ptimer")
+    )?;
 
     terminal::enable_raw_mode()?;
 
@@ -546,14 +583,31 @@ fn main() -> Result<()> {
         // Handle input or resize
         if event::poll(tick)? {
             match event::read()? {
-                Event::Key(KeyEvent { code, modifiers, .. }) => {
+                Event::Key(KeyEvent {
+                    code, modifiers, ..
+                }) => {
                     match code {
                         KeyCode::Char('q') | KeyCode::Esc => {
                             // Log current phase if it was running
                             match state.phase {
-                                Phase::Work => log_phase(&cfg.log_path, Phase::Work, cfg.work_sec, state.started_at),
-                                Phase::Short => log_phase(&cfg.log_path, Phase::Short, cfg.short_sec, state.started_at),
-                                Phase::Long => log_phase(&cfg.log_path, Phase::Long, cfg.long_sec, state.started_at),
+                                Phase::Work => log_phase(
+                                    &cfg.log_path,
+                                    Phase::Work,
+                                    cfg.work_sec,
+                                    state.started_at,
+                                ),
+                                Phase::Short => log_phase(
+                                    &cfg.log_path,
+                                    Phase::Short,
+                                    cfg.short_sec,
+                                    state.started_at,
+                                ),
+                                Phase::Long => log_phase(
+                                    &cfg.log_path,
+                                    Phase::Long,
+                                    cfg.long_sec,
+                                    state.started_at,
+                                ),
                                 Phase::Idle => {}
                             }
                             break 'outer;
@@ -603,14 +657,22 @@ fn main() -> Result<()> {
                             Phase::Idle => 0,
                         };
                         log_phase(&cfg.log_path, finished_phase, cfg_secs, state.started_at);
-                        alert_bring_to_front();
+                        alert_bring_to_front(finished_phase);
 
                         if finished_phase == Phase::Work {
                             state.sessions_completed += 1;
                             let long_break = state.sessions_completed % cfg.long_every == 0;
-                            let next_phase = if long_break { Phase::Long } else { Phase::Short };
+                            let next_phase = if long_break {
+                                Phase::Long
+                            } else {
+                                Phase::Short
+                            };
                             update_phase(&mut state, next_phase, &cfg);
-                            state.remaining = if long_break { cfg.long_sec as f64 } else { cfg.short_sec as f64 };
+                            state.remaining = if long_break {
+                                cfg.long_sec as f64
+                            } else {
+                                cfg.short_sec as f64
+                            };
                             state.started_at = Some(Instant::now());
                             state.paused = false;
                         } else {

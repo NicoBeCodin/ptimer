@@ -3,13 +3,13 @@
 
 [durations]
 # Work session duration in minutes
-work_min = 25
+work_min = 50
 
 # Short break duration in minutes
-short_min = 5
+short_min = 10
 
 # Long break duration in minutes
-long_min = 15
+long_min = 20
 
 # Number of work sessions before a long break
 long_every = 4
