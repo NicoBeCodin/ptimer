@@ -35,6 +35,7 @@ cargo run --release
 
 - **`s`** - Start a work session
 - **`p`** - Pause/resume the current timer
+- **`r`** - Reset the current work or break session to its full duration
 - **`e`** - Open settings
 - **`q`** or **`Esc`** - Quit the application
 
@@ -47,6 +48,11 @@ Press `e` from the timer to open settings. Use:
 - **`Enter`**, **`e`**, or **`Esc`** - Return to the timer
 - **`r`** - Restore defaults
 - **`t`** - Test the currently selected desktop and sound alerts
+
+Settings remain available while a session runs. The countdown continues and its
+remaining time appears at the top of the settings screen. Resetting with `r` keeps
+the current phase and its paused/running state. Work sessions are numbered from 1;
+the completed-session count remains separate.
 
 Work, break, art, animation, clock, and notification preferences save immediately to
 `~/.config/ptimer/settings.toml` (or the platform-equivalent config directory) and
@@ -130,8 +136,15 @@ clips or hides in small terminal layouts.
 
 The **Desktop notice** setting supports **off**, **normal**, and **urgent**. The
 independent **Sound alert** setting supports **off**, **terminal bell**, and
-**system chime**. The system chime uses the desktop's standard completion sound and
-falls back to the terminal bell if the sound service is unavailable.
+**audible bell**, and **alarm chime**. Both audible options play through the desktop
+audio server; the terminal bell is a last-resort fallback. Normal desktop notices
+request 15 seconds on screen, while urgent notices request persistence. A matching
+completion banner remains in ptimer for 15 seconds.
+
+The optional **Panel timer** setting shows the phase and remaining time in Linux
+Mint's XApp status applet (including this laptop's Xfce panel). It updates once per
+second and disappears when ptimer closes. Other desktops without XApp continue to
+run ptimer normally without a panel label.
 
 Small MIT-licensed animation elements from `cli-spinners` and `asciicity` are
 credited in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md); the complete scenes

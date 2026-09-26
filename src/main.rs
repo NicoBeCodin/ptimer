@@ -2,6 +2,7 @@ use std::cmp::{max, min};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -18,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 mod animation;
+mod panel;
 
 const DEFAULT_ASCII_ART: &str = include_str!("../default_ascii.txt");
 
@@ -254,8 +256,8 @@ impl SoundStyle {
     fn label(self) -> &'static str {
         match self {
             Self::Off => "off",
-            Self::Bell => "terminal bell",
-            Self::Chime => "system chime",
+            Self::Bell => "audible bell",
+            Self::Chime => "alarm chime",
         }
     }
     fn cycle(self, delta: i32) -> Self {
@@ -297,6 +299,7 @@ struct Preferences {
     clock_style: ClockStyle,
     notifications: NotificationStyle,
     sound: SoundStyle,
+    panel_status: bool,
 }
 
 impl Default for Preferences {
@@ -310,7 +313,8 @@ impl Default for Preferences {
             animations_enabled: true,
             clock_style: ClockStyle::Digital,
             notifications: NotificationStyle::Urgent,
-            sound: SoundStyle::Bell,
+            sound: SoundStyle::Chime,
+            panel_status: false,
         }
     }
 }
@@ -330,6 +334,7 @@ struct Config {
     clock_style: ClockStyle,
     notifications: NotificationStyle,
     sound: SoundStyle,
+    panel_status: bool,
 }
 
 impl Config {
@@ -344,6 +349,7 @@ impl Config {
             clock_style: self.clock_style,
             notifications: self.notifications,
             sound: self.sound,
+            panel_status: self.panel_status,
         }
     }
 
@@ -371,6 +377,7 @@ struct State {
     selected_setting: usize,
     save_message: Option<String>,
     animation_frame: usize,
+    completion_notice: Option<(String, Instant)>,
 }
 
 fn read_ascii_for_phase(phase: Phase, cfg: &Config, frame: usize) -> Option<String> {
@@ -406,22 +413,34 @@ fn update_phase(state: &mut State, new_phase: Phase, cfg: &Config) {
 }
 
 fn play_sound(style: SoundStyle) {
-    match style {
-        SoundStyle::Off => {}
-        SoundStyle::Bell => {
+    let (file, event) = match style {
+        SoundStyle::Off => return,
+        SoundStyle::Bell => ("/usr/share/sounds/freedesktop/stereo/bell.oga", "bell"),
+        SoundStyle::Chime => (
+            "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga",
+            "alarm-clock-elapsed",
+        ),
+    };
+    let played = Path::new(file).is_file()
+        && which::which("paplay").is_ok()
+        && Command::new("paplay")
+            .arg("--volume=65536")
+            .arg(file)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .is_ok();
+    if !played {
+        let played = which::which("canberra-gtk-play").is_ok()
+            && Command::new("canberra-gtk-play")
+                .args(["--id", event, "--description", "PTimer complete"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .is_ok();
+        if !played {
             print!("\x07");
             let _ = io::stdout().flush();
-        }
-        SoundStyle::Chime => {
-            let played = which::which("canberra-gtk-play").is_ok()
-                && std::process::Command::new("canberra-gtk-play")
-                    .args(["--id", "complete", "--description", "PTimer complete"])
-                    .spawn()
-                    .is_ok();
-            if !played {
-                print!("\x07");
-                let _ = io::stdout().flush();
-            }
         }
     }
 }
@@ -435,18 +454,35 @@ fn send_desktop_notification(style: NotificationStyle, message: &str) {
     } else {
         "normal"
     };
-    let _ = std::process::Command::new("notify-send")
-        .args(["-u", urgency, "PTimer", message])
+    let timeout = if style == NotificationStyle::Urgent {
+        "0"
+    } else {
+        "15000"
+    };
+    let _ = Command::new("notify-send")
+        .args([
+            "--app-name=PTimer",
+            "--icon=alarm-clock",
+            "--urgency",
+            urgency,
+            "--expire-time",
+            timeout,
+            message,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn();
 }
 
-fn alert_user(phase: Phase, cfg: &Config) {
+fn alert_user(phase: Phase, session_number: u64, cfg: &Config) {
     play_sound(cfg.sound);
-    let msg = format!(
-        "\n\n\n  =============== {} ENDED ===============  \n\n\n",
-        phase.log_label()
-    );
-    send_desktop_notification(cfg.notifications, &msg);
+    let title = match phase {
+        Phase::Work => format!("WORK SESSION {session_number} COMPLETE"),
+        Phase::Short => "SHORT BREAK COMPLETE".to_string(),
+        Phase::Long => "LONG BREAK COMPLETE".to_string(),
+        Phase::Idle => return,
+    };
+    send_desktop_notification(cfg.notifications, &title);
 }
 
 fn test_alert(cfg: &Config) {
@@ -476,6 +512,32 @@ fn log_phase(log_path: &Path, phase: Phase, configured_secs: u64, started_at: Op
 fn human_mmss(total_seconds: f64) -> String {
     let total = max(0, total_seconds.ceil() as i64) as u64;
     format!("{:02}:{:02}", total / 60, total % 60)
+}
+
+fn displayed_work_session(state: &State) -> u64 {
+    if matches!(state.phase, Phase::Short | Phase::Long) {
+        state.sessions_completed.max(1)
+    } else {
+        state.sessions_completed.saturating_add(1)
+    }
+}
+
+fn phase_duration(phase: Phase, cfg: &Config) -> u64 {
+    match phase {
+        Phase::Idle => 0,
+        Phase::Work => cfg.work_sec,
+        Phase::Short => cfg.short_sec,
+        Phase::Long => cfg.long_sec,
+    }
+}
+
+fn reset_current_session(state: &mut State, cfg: &Config) {
+    if state.phase == Phase::Idle {
+        return;
+    }
+    state.remaining = phase_duration(state.phase, cfg) as f64;
+    state.started_at = Some(Instant::now());
+    state.completion_notice = None;
 }
 
 fn load_preferences(path: &Path, defaults: Preferences) -> Preferences {
@@ -567,6 +629,7 @@ fn parse_cli() -> Config {
         clock_style: preferences.clock_style,
         notifications: preferences.notifications,
         sound: preferences.sound,
+        panel_status: preferences.panel_status,
     }
 }
 
@@ -700,11 +763,24 @@ fn normal_screen(state: &State, cfg: &Config, width: u16, height: u16) -> Vec<St
         .collect();
     }
     let content_width = width.min(120).saturating_sub(2);
-    let mut lines = vec![center("PTIMER", content_width), String::new()];
-    let status = if state.paused {
-        format!("[ {} / PAUSED ]", state.phase.label())
+    let notice = state
+        .completion_notice
+        .as_ref()
+        .filter(|(_, expires)| Instant::now() < *expires)
+        .map(|(message, _)| message.as_str());
+    let mut lines = vec![
+        center("PTIMER", content_width),
+        notice.map_or_else(String::new, |message| center(message, content_width)),
+    ];
+    let phase_label = if state.phase == Phase::Work {
+        format!("WORK #{}", displayed_work_session(state))
     } else {
-        format!("[ {} ]", state.phase.label())
+        state.phase.label().to_string()
+    };
+    let status = if state.paused {
+        format!("[ {phase_label} / PAUSED ]")
+    } else {
+        format!("[ {phase_label} ]")
     };
     if cfg.art_style.is_grand() && width >= 76 && height >= 22 {
         lines.push(center(&status, content_width));
@@ -780,25 +856,27 @@ fn normal_screen(state: &State, cfg: &Config, width: u16, height: u16) -> Vec<St
         lines.push(String::new());
         lines.push(center(
             &format!(
-                "sessions {} / long break every {}",
-                state.sessions_completed, cfg.long_every
+                "work session {}  |  completed {}  |  long break every {}",
+                displayed_work_session(state),
+                state.sessions_completed,
+                cfg.long_every
             ),
             content_width,
         ));
         lines.push(center(
-            "[s] start  [p] pause  [e] settings  [q] quit",
+            "[s] start  [p] pause  [r] reset  [e] settings  [q] quit",
             content_width,
         ));
     } else {
         lines.push(center(
-            "s:start  p:pause  e:settings  q:quit",
+            "s:start p:pause r:reset e:settings q:quit",
             content_width,
         ));
     }
     lines
 }
 
-const SETTING_COUNT: usize = 9;
+const SETTING_COUNT: usize = 10;
 
 fn settings_screen(state: &State, cfg: &Config, width: u16, height: u16) -> Vec<String> {
     let content_width = width.min(72).saturating_sub(2).max(1);
@@ -815,10 +893,25 @@ fn settings_screen(state: &State, cfg: &Config, width: u16, height: u16) -> Vec<
         ("Clock", cfg.clock_style.label().to_string()),
         ("Desktop notice", cfg.notifications.label().to_string()),
         ("Sound alert", cfg.sound.label().to_string()),
+        (
+            "Panel timer",
+            if cfg.panel_status { "on" } else { "off" }.to_string(),
+        ),
     ];
     let mut lines = vec![
         center("PTIMER SETTINGS", content_width),
-        center("use arrows to select and change", content_width),
+        center(
+            &format!(
+                "{} {}  |  arrows select/change",
+                state.phase.label(),
+                if state.phase == Phase::Idle {
+                    "--:--".to_string()
+                } else {
+                    human_mmss(state.remaining)
+                }
+            ),
+            content_width,
+        ),
         String::new(),
     ];
     let reserved_rows = if state.save_message.is_some() { 6 } else { 5 };
@@ -877,9 +970,17 @@ fn draw(state: &State, cfg: &Config) -> Result<()> {
     let y_offset = rows.saturating_sub(block_height) / 2;
     for (row, line) in lines.iter().take(rows as usize).enumerate() {
         let selected_settings_row = state.settings_open && line.starts_with('>');
+        let completion_row = !state.settings_open
+            && row == 1
+            && state
+                .completion_notice
+                .as_ref()
+                .is_some_and(|(_, expires)| Instant::now() < *expires);
         let line = truncate_to_width(line, cols as usize);
         let x = cols.saturating_sub(display_width(&line) as u16) / 2;
-        let color = if state.settings_open {
+        let color = if completion_row {
+            Color::Yellow
+        } else if state.settings_open {
             if selected_settings_row {
                 Color::Cyan
             } else {
@@ -898,10 +999,10 @@ fn draw(state: &State, cfg: &Config) -> Result<()> {
             cursor::MoveTo(x, y_offset + row as u16),
             SetForegroundColor(color)
         )?;
-        if row == 0 {
+        if row == 0 || completion_row {
             queue!(out, SetAttribute(Attribute::Bold))?;
         }
-        if selected_settings_row {
+        if selected_settings_row || completion_row {
             queue!(out, SetAttribute(Attribute::Reverse))?;
         }
         queue!(out, Print(line), SetAttribute(Attribute::Reset), ResetColor)?;
@@ -936,6 +1037,7 @@ fn change_setting(state: &mut State, cfg: &mut Config, delta: i32) {
         6 => cfg.clock_style = cfg.clock_style.cycle(delta),
         7 => cfg.notifications = cfg.notifications.cycle(delta),
         8 => cfg.sound = cfg.sound.cycle(delta),
+        9 => cfg.panel_status = !cfg.panel_status,
         _ => {}
     }
     state.save_message = Some(match cfg.save() {
@@ -955,6 +1057,7 @@ fn reset_settings(state: &mut State, cfg: &mut Config) {
     cfg.clock_style = defaults.clock_style;
     cfg.notifications = defaults.notifications;
     cfg.sound = defaults.sound;
+    cfg.panel_status = defaults.panel_status;
     state.animation_frame = 0;
     state.ascii_art = read_ascii_for_phase(state.phase, cfg, 0);
     state.save_message = Some(match cfg.save() {
@@ -993,6 +1096,7 @@ fn main() -> Result<()> {
         selected_setting: 0,
         save_message: None,
         animation_frame: 0,
+        completion_notice: None,
     };
     execute!(
         io::stdout(),
@@ -1007,6 +1111,8 @@ fn main() -> Result<()> {
     let mut previous_tick = Instant::now();
     let mut last_drawn_second = -1;
     let mut last_animation_draw = Instant::now();
+    let mut panel_status = panel::PanelStatus::default();
+    panel_status.sync(&state, &cfg);
     'outer: loop {
         if event::poll(tick)? {
             match event::read()? {
@@ -1045,29 +1151,37 @@ fn main() -> Result<()> {
                             _ => {}
                         }
                         draw(&state, &cfg)?;
-                        continue;
-                    }
-                    match code {
-                        KeyCode::Char('q') | KeyCode::Esc => break 'outer,
-                        KeyCode::Char('e') => {
-                            state.settings_open = true;
-                            state.save_message = None;
-                            draw(&state, &cfg)?;
+                    } else {
+                        match code {
+                            KeyCode::Char('q') | KeyCode::Esc => break 'outer,
+                            KeyCode::Char('e') => {
+                                state.settings_open = true;
+                                state.save_message = None;
+                                draw(&state, &cfg)?;
+                            }
+                            KeyCode::Char('s')
+                                if matches!(
+                                    state.phase,
+                                    Phase::Idle | Phase::Short | Phase::Long
+                                ) =>
+                            {
+                                update_phase(&mut state, Phase::Work, &cfg);
+                                state.remaining = cfg.work_sec as f64;
+                                state.started_at = Some(Instant::now());
+                                state.paused = false;
+                                state.completion_notice = None;
+                                draw(&state, &cfg)?;
+                            }
+                            KeyCode::Char('p') if state.phase != Phase::Idle => {
+                                state.paused = !state.paused;
+                                draw(&state, &cfg)?;
+                            }
+                            KeyCode::Char('r') if state.phase != Phase::Idle => {
+                                reset_current_session(&mut state, &cfg);
+                                draw(&state, &cfg)?;
+                            }
+                            _ => {}
                         }
-                        KeyCode::Char('s')
-                            if matches!(state.phase, Phase::Idle | Phase::Short | Phase::Long) =>
-                        {
-                            update_phase(&mut state, Phase::Work, &cfg);
-                            state.remaining = cfg.work_sec as f64;
-                            state.started_at = Some(Instant::now());
-                            state.paused = false;
-                            draw(&state, &cfg)?;
-                        }
-                        KeyCode::Char('p') if state.phase != Phase::Idle => {
-                            state.paused = !state.paused;
-                            draw(&state, &cfg)?;
-                        }
-                        _ => {}
                     }
                 }
                 Event::Resize(cols, rows) => {
@@ -1081,10 +1195,7 @@ fn main() -> Result<()> {
         let elapsed = now.duration_since(previous_tick).as_secs_f64();
         previous_tick = now;
         let mut drew_this_tick = false;
-        if !state.paused
-            && !state.settings_open
-            && matches!(state.phase, Phase::Work | Phase::Short | Phase::Long)
-        {
+        if !state.paused && matches!(state.phase, Phase::Work | Phase::Short | Phase::Long) {
             state.remaining -= elapsed;
             if state.remaining <= 0.0 {
                 let finished = state.phase;
@@ -1095,7 +1206,15 @@ fn main() -> Result<()> {
                     Phase::Idle => 0,
                 };
                 log_phase(&cfg.log_path, finished, seconds, state.started_at);
-                alert_user(finished, &cfg);
+                let session_number = displayed_work_session(&state);
+                alert_user(finished, session_number, &cfg);
+                let notice = match finished {
+                    Phase::Work => format!("WORK SESSION {session_number} COMPLETE"),
+                    Phase::Short => "SHORT BREAK COMPLETE".to_string(),
+                    Phase::Long => "LONG BREAK COMPLETE".to_string(),
+                    Phase::Idle => String::new(),
+                };
+                state.completion_notice = Some((notice, now + Duration::from_secs(15)));
                 if finished == Phase::Work {
                     state.sessions_completed += 1;
                     let long = state.sessions_completed.is_multiple_of(cfg.long_every);
@@ -1135,6 +1254,17 @@ fn main() -> Result<()> {
                 draw(&state, &cfg)?;
             }
         }
+        if state
+            .completion_notice
+            .as_ref()
+            .is_some_and(|(_, expires)| now >= *expires)
+        {
+            state.completion_notice = None;
+            if !state.settings_open {
+                draw(&state, &cfg)?;
+            }
+        }
+        panel_status.sync(&state, &cfg);
     }
     if matches!(state.phase, Phase::Work | Phase::Short | Phase::Long) {
         let seconds = match state.phase {
@@ -1185,7 +1315,8 @@ clock_style = "digital"
         .unwrap();
         assert!(preferences.animations_enabled);
         assert_eq!(preferences.notifications, NotificationStyle::Urgent);
-        assert_eq!(preferences.sound, SoundStyle::Bell);
+        assert_eq!(preferences.sound, SoundStyle::Chime);
+        assert!(!preferences.panel_status);
     }
 
     fn test_config() -> Config {
@@ -1203,6 +1334,7 @@ clock_style = "digital"
             clock_style: ClockStyle::Digital,
             notifications: NotificationStyle::Urgent,
             sound: SoundStyle::Bell,
+            panel_status: false,
         }
     }
 
@@ -1219,6 +1351,7 @@ clock_style = "digital"
             selected_setting: 0,
             save_message: None,
             animation_frame: 0,
+            completion_notice: None,
         }
     }
 
@@ -1258,5 +1391,24 @@ clock_style = "digital"
             read_ascii_for_phase(Phase::Idle, &cfg, 99).as_deref(),
             Some(DEFAULT_ASCII_ART.trim_end_matches('\n'))
         );
+    }
+
+    #[test]
+    fn session_numbers_start_at_one_and_reset_keeps_the_phase() {
+        let cfg = test_config();
+        let mut state = test_state((80, 24));
+        state.sessions_completed = 0;
+        assert_eq!(displayed_work_session(&state), 1);
+        state.remaining = 12.0;
+        state.paused = true;
+        reset_current_session(&mut state, &cfg);
+        assert_eq!(state.remaining, cfg.work_sec as f64);
+        assert_eq!(state.phase, Phase::Work);
+        assert!(state.paused);
+        state.sessions_completed = 1;
+        state.phase = Phase::Short;
+        reset_current_session(&mut state, &cfg);
+        assert_eq!(displayed_work_session(&state), 1);
+        assert_eq!(state.remaining, cfg.short_sec as f64);
     }
 }
